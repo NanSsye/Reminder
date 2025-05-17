@@ -2,7 +2,7 @@ import asyncio
 import re
 import tomllib
 from typing import List, Optional
-
+from database.contacts_db import get_contact_from_db #取得群名称
 from loguru import logger
 from WechatAPI import WechatAPIClient
 from database.XYBotDB import XYBotDB
@@ -19,7 +19,7 @@ from utils.event_manager import EventManager
 class Reminder(PluginBase):
     description = "备忘录插件"
     author = "老夏的金库"
-    version = "1.2.1"  # 更新版本号
+    version = "1.2.2"  # 更新版本号
 
     def __init__(self):
         super().__init__()
@@ -32,6 +32,7 @@ class Reminder(PluginBase):
         plugin_config = config["Reminder"]
 
         self.enable = plugin_config["enable"]
+        self.at_sender = plugin_config["at_sender"]
         self.commands = plugin_config["commands"]
         self.other_plugin_cmd = plugin_config["other-plugin_cmd"]
         self.command_tip = plugin_config["command-tip"]
@@ -50,14 +51,6 @@ class Reminder(PluginBase):
         self.delete_command = "删除"
         self.help_command = "记录帮助"
 
-        # 添加其他插件的触发命令列表
-        self.other_plugin_cmd = [
-            "早报",
-            "天气",
-            "新闻",
-            # ... 添加其他插件的触发命令
-        ]
-
     def get_db_path(self, wxid: str) -> str:
         db_name = f"user_{wxid}.db"
         return os.path.join(self.data_dir, db_name)
@@ -74,6 +67,7 @@ class Reminder(PluginBase):
                     reminder_type TEXT NOT NULL,
                     reminder_time TEXT NOT NULL,
                     chat_id TEXT NOT NULL,  -- 新增字段，存储创建时的聊天ID
+                    nickname TEXT, -- 新增字段，存储昵称：方便记录的管理
                     is_done INTEGER NOT NULL DEFAULT 0
                 )
             """)
@@ -83,7 +77,7 @@ class Reminder(PluginBase):
         finally:
             conn.close()
 
-    async def store_reminder(self, wxid: str, content: str, reminder_type: str, reminder_time: str, chat_id: str) -> Optional[int]:
+    async def store_reminder(self, wxid: str, content: str, reminder_type: str, reminder_time: str, chat_id: str, nickname:str) -> Optional[int]:
         db_path = self.get_db_path(wxid)
         self.create_table(db_path)
         
@@ -105,11 +99,11 @@ class Reminder(PluginBase):
         try:
             conn = sqlite3.connect(db_path)
             cursor = conn.cursor()
-            cursor.execute("INSERT INTO reminders (wxid, content, reminder_type, reminder_time, chat_id) VALUES (?, ?, ?, ?, ?)",
-                           (wxid, content, reminder_type, reminder_time, chat_id))
+            cursor.execute("INSERT INTO reminders (wxid, content, reminder_type, reminder_time, chat_id, nickname) VALUES (?, ?, ?, ?, ?, ?)",
+                           (wxid, content, reminder_type, reminder_time, chat_id, nickname))
             new_id = cursor.lastrowid
             conn.commit()
-            logger.info(f"用户 {wxid} 存储备忘录成功: {content}, {reminder_type}, {reminder_time}, chat_id={chat_id}")
+            logger.info(f"用户 {wxid} 存储备忘录成功: {content}, {reminder_type}, {reminder_time}, chat_id={chat_id}, nickname={nickname}")
             return new_id
         except sqlite3.Error as e:
             logger.exception(f"存储备忘录失败: {e}")
@@ -124,7 +118,7 @@ class Reminder(PluginBase):
         try:
             conn = sqlite3.connect(db_path)
             cursor = conn.cursor()
-            cursor.execute("SELECT id, content, reminder_type, reminder_time, chat_id FROM reminders WHERE wxid = ? AND is_done = 0", (wxid,))
+            cursor.execute("SELECT id, content, reminder_type, reminder_time, chat_id, nickname FROM reminders WHERE wxid = ? AND is_done = 0", (wxid,))
             results = cursor.fetchall()
             conn.close()
             return results
@@ -177,23 +171,24 @@ class Reminder(PluginBase):
         chat_id = message["FromWxid"]
         message_id = message["MsgId"]
         is_group_chat = chat_id.endswith("chatroom")
+        nickname = get_contact_from_db(chat_id).get("nickname", "")
 
         if not self.enable:
             return True
 
         if content == self.store_command or (content.startswith(self.store_command) and len(content.strip()) == len(self.store_command)):
             help_message = (
-                "📝-----老夏的金库-----📝\n"
+                "📝-----自动提醒-----📝\n"
                 "⏰备忘录使用说明\n\n"
                 "🕒支持的时间格式:\n"
-                " - 每天 HH:MM（如：每天 08:00）\n"
+                " - 每天HH:MM（如：每天08:00）\n"
                 " - 每周一/二/三/四/五/六/日 HH:MM\n"
-                " - 每月DD HH:MM\n"
+                " - 每月DDHH:MM\n"
                 " - XX分钟后\n - XX小时后\n - XX天后\n\n"
                 "📝示例:\n"
-                " - 记录 每天 08:00 早报\n"
-                " - 记录 每天 12:00 天气 北京\n"
-                " - 记录 每周一 09:00 新闻\n"
+                " - 记录 每天08:00 早报\n"
+                " - 记录 每天12:00 天气 北京\n"
+                " - 记录 每周一09:00 新闻\n"
                 " - 记录 30分钟后 提醒我喝水\n\n"
                 "📋支持的提示词:\n"
                 f"{', '.join(self.other_plugin_cmd)}\n\n"
@@ -204,7 +199,7 @@ class Reminder(PluginBase):
             )
             
             try:
-                if is_group_chat:
+                if is_group_chat and self.at_sender:
                     await bot.send_at_message(chat_id, help_message, [wxid])
                 else:
                     await bot.send_text_message(chat_id, help_message)
@@ -216,11 +211,11 @@ class Reminder(PluginBase):
         elif content.startswith(self.store_command):
             try:
                 info = content[len(self.store_command):].strip()
-                parts = info.split(maxsplit=2)
+                parts = info.split(maxsplit=1)
                 if len(parts) < 2:
                     error_msg = "\n参数错误！请使用：记录 [时间/周期] [内容]"
                     if is_group_chat:
-                        await bot.send_at_message(chat_id, error_msg, [wxid])
+                        await bot.send_text_message(chat_id, error_msg)
                     else:
                         await bot.send_text_message(chat_id, error_msg)
                     return False
@@ -315,7 +310,7 @@ class Reminder(PluginBase):
                         return False
 
                 if await self._check_point(bot, message):
-                    new_id = await self.store_reminder(wxid, reminder_content, reminder_type, reminder_time, chat_id)
+                    new_id = await self.store_reminder(wxid, reminder_content, reminder_type, reminder_time, chat_id, nickname)
                     if new_id is not None:
                         output = "🎉成功存储备忘录\n"
                         output += f"🆔任务ID：{new_id}\n"
@@ -325,24 +320,14 @@ class Reminder(PluginBase):
                         else:
                             output += f"⏱️提醒时间：未知\n"
                         output += "——————————————————\n"
-                        existing_reminders = await self.query_reminders(wxid)
-                        if existing_reminders:
-                            output += "📝您当前的记录如下：\n"
-                            for id, content, reminder_type, reminder_time, _ in existing_reminders:
-                                existing_next_time = await self.calculate_remind_time(reminder_type, reminder_time)
-                                if existing_next_time:
-                                    output += f"👉 {id}. {content} (提醒时间：{existing_next_time.strftime('%Y-%m-%d %H:%M')})\n"
-                                else:
-                                    output += f"👉 {id}. {content} (提醒时间：未知)\n"
-                        else:
-                            output += "目前您还没有其他记录哦😉"
-                        if is_group_chat:
+
+                        if is_group_chat and self.at_sender:
                             await bot.send_at_message(chat_id, output, [wxid])
                         else:
                             await bot.send_text_message(chat_id, output)
                     else:
                         error_msg = "\n存储备忘录失败，请稍后再试"
-                        if is_group_chat:
+                        if is_group_chat and self.at_sender:
                             await bot.send_at_message(chat_id, error_msg, [wxid])
                         else:
                             await bot.send_text_message(chat_id, error_msg)
@@ -354,7 +339,7 @@ class Reminder(PluginBase):
             except Exception as e:
                 logger.exception(f"处理存储备忘录指令时出错: {e}")
                 error_msg = "\n参数错误或服务器错误，请稍后再试"
-                if is_group_chat:
+                if is_group_chat and self.at_sender:
                     await bot.send_at_message(chat_id, error_msg, [wxid])
                 else:
                     await bot.send_text_message(chat_id, error_msg)
@@ -365,20 +350,20 @@ class Reminder(PluginBase):
             reminders = await self.query_reminders(wxid)
             print(f"查询到的记录: {reminders}")
             if reminders:
-                output = "📝-----老夏的金库-----📝\n您的记录：\n"
-                for id, content, reminder_type, reminder_time, _ in reminders:
+                output = "📝-----自动提醒-----📝\n您的记录：\n"
+                for id, content, reminder_type, reminder_time,  _, nickname in reminders:
                     next_time = await self.calculate_remind_time(reminder_type, reminder_time)
                     if next_time:
-                        output += f"👉 {id}. {content} (提醒时间：{next_time.strftime('%Y-%m-%d %H:%M')})\n"
+                        output += f"👉 {id}. {content} (提醒：{next_time.strftime('%Y-%m-%d %H:%M')}) 来自:{nickname}\n"
                     else:
-                        output += f"👉 {id}. {content} (提醒时间：未知)\n"
-                if is_group_chat:
+                        output += f"👉 {id}. {content} (提醒：未知)\n"
+                if is_group_chat and self.at_sender:
                     await bot.send_at_message(chat_id, output, [wxid])
                 else:
                     await bot.send_text_message(chat_id, output)
             else:
                 empty_msg = "您还没有任何记录😔"
-                if is_group_chat:
+                if is_group_chat and self.at_sender:
                     await bot.send_at_message(chat_id, empty_msg, [wxid])
                 else:
                     await bot.send_text_message(chat_id, empty_msg)
@@ -391,13 +376,13 @@ class Reminder(PluginBase):
                 if delete_id == "全部":
                     if await self.delete_all_reminders(wxid):
                         success_msg = "🗑️已清空所有记录"
-                        if is_group_chat:
+                        if is_group_chat and self.at_sender:
                             await bot.send_at_message(chat_id, success_msg, [wxid])
                         else:
                             await bot.send_text_message(chat_id, success_msg)
                     else:
                         fail_msg = "❌清空记录失败，请稍后再试"
-                        if is_group_chat:
+                        if is_group_chat and self.at_sender:
                             await bot.send_at_message(chat_id, fail_msg, [wxid])
                         else:
                             await bot.send_text_message(chat_id, fail_msg)
@@ -407,13 +392,13 @@ class Reminder(PluginBase):
                 reminder_id = int(delete_id)
                 if await self.delete_reminder(wxid, reminder_id):
                     success_msg = f"🗑️成功删除记录 {reminder_id}"
-                    if is_group_chat:
+                    if is_group_chat and self.at_sender:
                         await bot.send_at_message(chat_id, success_msg, [wxid])
                     else:
                         await bot.send_text_message(chat_id, success_msg)
                 else:
                     fail_msg = f"❌删除记录 {reminder_id} 失败，请稍后再试"
-                    if is_group_chat:
+                    if is_group_chat and self.at_sender:
                         await bot.send_at_message(chat_id, fail_msg, [wxid])
                     else:
                         await bot.send_text_message(chat_id, fail_msg)
@@ -421,7 +406,7 @@ class Reminder(PluginBase):
                 
             except ValueError:
                 error_msg = "\n参数错误！请使用：\n删除 <记录ID> 或\n删除 全部"
-                if is_group_chat:
+                if is_group_chat and self.at_sender:
                     await bot.send_at_message(chat_id, error_msg, [wxid])
                 else:
                     await bot.send_text_message(chat_id, error_msg)
@@ -429,7 +414,7 @@ class Reminder(PluginBase):
             except Exception as e:
                 logger.exception(f"处理删除记录指令时出错: {e}")
                 error_msg = "\n处理删除指令时出现错误，请稍后再试"
-                if is_group_chat:
+                if is_group_chat and self.at_sender:
                     await bot.send_at_message(chat_id, error_msg, [wxid])
                 else:
                     await bot.send_text_message(chat_id, error_msg)
@@ -445,7 +430,7 @@ class Reminder(PluginBase):
             help_message += " - 记录 17:30 下班提醒\n\n"
             help_message += "📋管理提醒:\n - 我的记录 (查看所有提醒)\n - 删除 序号 (取消单个提醒)\n"
             help_message += " - 删除 全部 (取消所有提醒)\n - 记录帮助 (查看帮助信息)"
-            if is_group_chat:
+            if is_group_chat and self.at_sender:
                 await bot.send_at_message(chat_id, help_message, [wxid])
             else:
                 await bot.send_text_message(chat_id, help_message)
@@ -471,7 +456,7 @@ class Reminder(PluginBase):
             try:
                 reminders = await self.query_reminders(wxid)
                 if reminders:
-                    for id, content, reminder_type, reminder_time, chat_id in reminders:
+                    for id, content, reminder_type, reminder_time, chat_id, _ in reminders:
                         try:
                             if reminder_type == "every_day":
                                 next_time = await self.calculate_remind_time("every_day", reminder_time)
@@ -558,7 +543,7 @@ class Reminder(PluginBase):
             logger.error(f"获取用户 {wxid} 昵称失败: {e}")
             nickname = "用户"
 
-        output = f"⏰-----老夏的记录-----⏰\n"
+        output = f"⏰-----老鲁的记录-----⏰\n"
         output += "⏳达到时间啦⏳\n"
         output += f"🆔任务ID：{reminder_id}\n"
         output += f"🗒️内 容：{content}\n"
@@ -566,7 +551,7 @@ class Reminder(PluginBase):
         output += "——————————————————\n"
         
         if chat_id.endswith("@chatroom"):
-            await bot.send_at_message(chat_id, output, [wxid])
+            await bot.send_text_message(chat_id, output)
         else:
             await bot.send_text_message(chat_id, output)
 
@@ -588,8 +573,8 @@ class Reminder(PluginBase):
             return True
         else:
             if self.db.get_points(wxid) < self.price:
-                error_msg = f"\n😭-----老夏的金库-----\n你的积分不够啦！需要 {self.price} 积分"
-                if is_group_chat:
+                error_msg = f"\n😭-----自动提醒-----\n你的积分不够啦！需要 {self.price} 积分"
+                if is_group_chat and self.at_sender:
                     await bot.send_at_message(chat_id, error_msg, [wxid])
                 else:
                     await bot.send_text_message(chat_id, error_msg)
@@ -629,11 +614,16 @@ class Reminder(PluginBase):
                 weekday, time_str = reminder_time.split()
                 weekday = int(weekday)
                 hour, minute = map(int, time_str.split(":"))
-                days_ahead = weekday - now.weekday()
-                if days_ahead <= 0:
-                    days_ahead += 7
-                next_time = now + timedelta(days=days_ahead)
-                return next_time.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                target_weekday_py = weekday - 1 #  修正了Python 的星期从0开始
+                current_weekday_py = now.weekday()
+                days_ahead = (target_weekday_py - current_weekday_py + 7) % 7
+                next_time = (now + timedelta(days=days_ahead)).replace(
+                    hour=hour, minute=minute, second=0, microsecond=0
+                )
+                if next_time <= now:
+                    next_time += timedelta(days=7)
+                
+                return next_time
             
             elif reminder_type == "monthly":
                 day, time_str = reminder_time.split()
