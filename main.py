@@ -50,14 +50,6 @@ class Reminder(PluginBase):
         self.delete_command = "删除"
         self.help_command = "记录帮助"
 
-        # 添加其他插件的触发命令列表
-        self.other_plugin_cmd = [
-            "早报",
-            "天气",
-            "新闻",
-            # ... 添加其他插件的触发命令
-        ]
-
     def get_db_path(self, wxid: str) -> str:
         db_name = f"user_{wxid}.db"
         return os.path.join(self.data_dir, db_name)
