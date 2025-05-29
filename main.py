@@ -19,7 +19,7 @@ from utils.event_manager import EventManager
 class Reminder(PluginBase):
     description = "备忘录插件"
     author = "老夏的金库"
-    version = "1.2.1"  # 更新版本号
+    version = "1.3.0"  # 更新版本号
 
     def __init__(self):
         super().__init__()
